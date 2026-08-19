@@ -101,3 +101,7 @@ See [`docs/README_PROGRAMS.md`](docs/README_PROGRAMS.md) for available programs,
 ## Version
 
 **YabroOS-32 0.0.1 Alpha**
+
+## Screenshot
+
+<img width="1273" height="637" alt="image" src="https://github.com/user-attachments/assets/0f10035a-ef05-44d1-918a-42e0d1345329" />
