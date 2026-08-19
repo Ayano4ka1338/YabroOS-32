@@ -44,11 +44,7 @@ sudo apt update
 sudo apt install build-essential binutils rustup xorriso dosfstools mtools git ca-certificates
 rustup default stable
 rustup target add x86_64-unknown-none
-```
-
-Then build:
-
-```sh
+chmod +x *.sh
 ./build.sh
 ```
 
@@ -58,6 +54,7 @@ Then build:
 sudo dnf install gcc gcc-c++ binutils make rustup xorriso dosfstools mtools git ca-certificates
 rustup default stable
 rustup target add x86_64-unknown-none
+chmod +x *.sh
 ./build.sh
 ```
 
@@ -67,6 +64,7 @@ rustup target add x86_64-unknown-none
 sudo pacman -S --needed base-devel binutils rustup xorriso dosfstools mtools git ca-certificates
 rustup default stable
 rustup target add x86_64-unknown-none
+chmod +x *.sh
 ./build.sh
 ```
 
