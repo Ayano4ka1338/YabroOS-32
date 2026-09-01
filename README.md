@@ -1,12 +1,12 @@
-# YabroOS-32 0.0.1 Alpha
+# YabroOS-32 0.0.2 Alpha
 
-YabroOS-32 is an experimental x86_64 operating system. This release is **0.0.1 Alpha**.
+YabroOS-32 is an experimental x86_64 operating system. This release is **0.0.2 Alpha**.
 
 The current system combines a Rust kernel layer, freestanding C kernel subsystems, x86_64 system calls, a VFS, YSH, YabrusBox, and an incremental musl userspace bring-up.
 
 ## Current status
 
-The 0.0.1 Alpha baseline includes: 
+The 0.0.2 Alpha baseline includes: 
 
 - x86_64 Limine boot
 - Rust and C kernel components
@@ -18,7 +18,7 @@ The 0.0.1 Alpha baseline includes:
 - YSH shell
 - YabrusBox multicall utilities
 - file operations including `mkdir`, `rmdir`, `rm`, `cp`, `mv`, `cat`, `echo` and `ls`
-- `REALMUSL4.ELF`, exposed as `MUSL4.ELF` in the image
+- Freedoom game
 
 This is an alpha operating system. Interfaces can still change.
 
@@ -27,8 +27,7 @@ This is an alpha operating system. Interfaces can still change.
 ```text
 src/
 ├── kernel/      Rust/C kernel, VFS and syscall entry
-├── user/        YSH, YabrusBox and sample userspace programs
-└── tests/       userspace and VFS smoke tests
+└── user/        YSH, YabrusBox and sample userspace programs
 
 musl-port/       REALMUSL4 and libc bring-up work
 limine-bin/      bootloader files used by the build
@@ -98,8 +97,9 @@ See [`docs/README_PROGRAMS.md`](docs/README_PROGRAMS.md) for available programs,
 
 ## Version
 
-**YabroOS-32 0.0.1 Alpha**
+**YabroOS-32 0.0.2 Alpha**
 
 ## Screenshot
 
-<img width="1273" height="637" alt="image" src="https://github.com/user-attachments/assets/0f10035a-ef05-44d1-918a-42e0d1345329" />
+<img width="1280" height="801" alt="photo_2026-09-01_19-15-17" src="https://github.com/user-attachments/assets/3aae8f81-9bb7-4cbc-8590-80b1839287de" />
+
