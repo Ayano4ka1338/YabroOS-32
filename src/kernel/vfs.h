@@ -24,7 +24,8 @@ enum vfs_node_type {
 	VFS_NODE_SYS_FILE     = 16,
 	VFS_NODE_BOOT_FILE    = 17,
 	VFS_NODE_DEV_INPUT   = 19,
-	VFS_NODE_DEV_INPUT_MOUSE = 20
+	VFS_NODE_DEV_INPUT_MOUSE = 20,
+	VFS_NODE_SOCKET          = 21
 };
 
 struct vfs_node;
@@ -53,6 +54,8 @@ struct vfs_node {
 	uint8_t        *data;
 	uint64_t        size;
 	uint64_t        capacity;
+	uint32_t        nlink;
+	struct vfs_node *inode_owner;
 };
 
 struct vfs_mount {
@@ -86,14 +89,17 @@ void             vfs_debug_dump(void);
 size_t           vfs_list_dir(const char *path, char *out, size_t cap);
 size_t           vfs_read_file(const char *path, char *out, size_t cap);
 struct vfs_node* vfs_create_file(const char *path, int truncate);
+struct vfs_node* vfs_create_socket(const char *path, uint32_t mode);
 struct vfs_node* vfs_mkdir(const char *path, uint32_t mode);
+int              vfs_ensure_dir(const char *path);
 int              vfs_unlink(const char *path);
 int              vfs_rmdir(const char *path);
 int              vfs_rename(const char *oldpath, const char *newpath);
+int              vfs_link(const char *oldpath, const char *newpath);
 
 int              vfs_file_truncate(struct vfs_node *n, uint64_t len);
 int              vfs_write_kernel_file(struct vfs_node *n, const uint8_t *data, uint64_t len);
-uint64_t         vfs_file_write(struct vfs_node *n, uint64_t off, const uint8_t *src, uint64_t len);
+int64_t          vfs_file_write(struct vfs_node *n, uint64_t off, const uint8_t *src, uint64_t len);
 
 int              vfs_file_is_regular(const struct vfs_node *n);
 int              vfs_is_boot_file(const struct vfs_node *n);

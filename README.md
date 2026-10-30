@@ -1,105 +1,150 @@
-# YabroOS-32 0.0.2 Alpha
+<div align="center">
 
-YabroOS-32 is an experimental x86_64 operating system. This release is **0.0.2 Alpha**.
+<img width="1280" height="800" alt="photo_2026-10-30_15-10-28" src="https://github.com/user-attachments/assets/46d9d930-d38e-475d-840c-85920050ce29" />
 
-The current system combines a Rust kernel layer, freestanding C kernel subsystems, x86_64 system calls, a VFS, YSH, YabrusBox, and an incremental musl userspace bring-up.
 
-## Current status
+<br>
 
-The 0.0.2 Alpha baseline includes: 
+# YabroOS-32
 
-- x86_64 Limine boot
-- Rust and C kernel components
-- PMM and VMM
-- ELF userspace loading
-- fork, exec, wait and basic process handling
-- syscall ABI
-- VFS with `/bin`, `/dev`, `/etc`, `/proc` and `/tmp`
-- YSH shell
-- YabrusBox multicall utilities
-- file operations including `mkdir`, `rmdir`, `rm`, `cp`, `mv`, `cat`, `echo` and `ls`
-- Freedoom game
+**Hobby x86_64 operating system with a hybrid C/Rust kernel.**
 
-This is an alpha operating system. Interfaces can still change.
+![status](https://img.shields.io/badge/status-v0.1%20experimental-orange)
+![arch](https://img.shields.io/badge/arch-x86__64-blue)
+![boot](https://img.shields.io/badge/boot-Limine%20BIOS%20%2F%20UEFI-lightgrey)
+![license](https://img.shields.io/badge/license-none%20yet-lightgrey)
 
-## Source tree
+</div>
+
+## Key features
+
+- **Hybrid kernel** written in C and Rust (`no_std`), with assembly for syscall entry.
+- **Boot** through Limine on both BIOS and UEFI.
+- **Memory management**: physical and virtual memory, ELF64 userspace loading.
+- **Virtual filesystem** with `/proc`, `/dev` and in-memory files and directories.
+- **Framebuffer** console and `/dev/fb0`, with an Xorg video path.
+- **Input**: PS/2 keyboard and mouse, exposed under `/dev/input/`.
+- **Shell (YSH)** with a file and system command set.
+- **Native musl** toolchain and a musl ABI test suite.
+- **Built-in compiler**: TCC with a static musl sysroot, so you can compile C inside the OS.
+- **Graphical session** via `startx` / `xinit` with the `cwm` window manager.
+- **Power control** through ACPI: `poweroff`, `reboot`.
+
+## Current stage
+
+YabroOS-32 is at **v0.1, experimental**. It boots under QEMU, runs an interactive shell, and can start a graphical session. Interfaces and hardware support are still changing. Use QEMU first.
+
+## What is in the build
+
+`./build.sh` produces `yabroos-32.iso` containing:
+
+- **Kernel**: C and Rust sources, linked to `kernel.elf`, with the Limine bootloader.
+- **Userspace**: YSH shell, YabrusBox applets, `startx` and `xinit`.
+- **Musl**: native musl ABI build and a test ELF (`ports/musl-abi`).
+- **TCC**: Tiny C Compiler with a static musl sysroot.
+- **Xorg runtime**: Alpine packages staged into the image, with `cwm` as the window manager.
+- **Doom**: port with Freedoom Phase 2 data.
+
+By default the shell is the boot program. To boot the hello-world test program instead, use `USER_TEST=hello ./build.sh`.
+
+## Build requirements
+
+Build on a 64-bit Linux host.
+
+**Debian / Ubuntu:**
+
+```bash
+sudo apt install build-essential binutils make python3 curl wget tar \
+  xorriso dosfstools mtools qemu-system-x86 musl-tools
+```
+
+**Rust** (needed for the kernel), with the bare-metal target:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+rustup target add x86_64-unknown-none
+```
+
+The first build downloads Alpine packages, TCC sources and Freedoom data, so it needs internet access. Later builds use the cache.
+
+## Building and running
+
+```bash
+chmod +x build.sh run.sh clean.sh
+./build.sh          # build the ISO
+./run.sh            # start it in QEMU (384 MiB RAM by default)
+./clean.sh          # remove build output
+```
+
+Change the RAM size with `YABRO_QEMU_MEMORY=512M ./run.sh`. QEMU writes debug output to `debug.log`.
+
+## Basic commands
+
+These run inside the YSH shell after boot.
+
+**Help and system**
 
 ```text
-src/
-├── kernel/      Rust/C kernel, VFS and syscall entry
-└── user/        YSH, YabrusBox and sample userspace programs
-
-musl-port/       REALMUSL4 and libc bring-up work
-limine-bin/      bootloader files used by the build
-docs/            project documentation and historical notes
+help                 list commands
+uname                system name and version
+uptime               time since boot
+mem                  memory usage
+ps                   list processes
+env                  show environment variables
+history              show command history
+cls                  clear the screen
 ```
 
-## Build on Debian
-
-Install the required host tools:
-
-```sh
-sudo apt update
-sudo apt install build-essential binutils rustup xorriso dosfstools mtools git ca-certificates
-rustup default stable
-rustup target add x86_64-unknown-none
-chmod +x *.sh
-./build.sh
-```
-
-## Build on Fedora
-
-```sh
-sudo dnf install gcc gcc-c++ binutils make rustup xorriso dosfstools mtools git ca-certificates
-rustup default stable
-rustup target add x86_64-unknown-none
-chmod +x *.sh
-./build.sh
-```
-
-## Build on Arch Linux
-
-```sh
-sudo pacman -S --needed base-devel binutils rustup xorriso dosfstools mtools git ca-certificates
-rustup default stable
-rustup target add x86_64-unknown-none
-chmod +x *.sh
-./build.sh
-```
-
-The build also requires the Limine files already stored in `limine-bin/`.
-
-## Running
-
-The build produces `yabroos-32.iso`. Boot it with your preferred x86_64 virtual machine or compatible hardware.
-
-The kernel shell prompt is:
+**Files and directories**
 
 ```text
-YabroOS-32>
+pwd                  print the current directory
+cd DIR               change directory
+ls [DIR]             list files
+cat FILE             print a file
+head FILE            first 10 lines of a file
+wc [FILE]            count lines, words and bytes
+echo TEXT            print text
+mkdir DIR            create a directory
+touch FILE           create an empty file
+cp SRC... DEST       copy files
+mv SRC... DEST       move or rename files
+rm [-rf] FILE...     remove files (-r for directories, -f to ignore missing)
 ```
 
-To start the userspace shell from the kernel shell:
+**Compiling**
 
 ```text
-run YSH.ELF
+tcc FILE.c           compile a C program with TCC
+cc FILE.c            same as tcc
 ```
 
-Inside YSH, userspace commands are provided by YabrusBox.
+**Power**
 
-## Debug policy
+```text
+poweroff             power off (ACPI)
+shutdown             same as poweroff
+reboot               restart
+exit                 leave the shell
+```
 
-The production build does not intentionally print the historical stage and audit traces. Debugging material is kept outside the normal runtime path.
+**Graphics: `startx`**
 
-## Documentation
+```text
+startx               start the Xorg session with the cwm window manager
+```
 
-See [`docs/README_PROGRAMS.md`](docs/README_PROGRAMS.md) for available programs, YabrusBox applets, and instructions for writing a userspace program for YabroOS-32.
+`startx` starts the X server through `xinit` and launches `/usr/bin/cwm`. It needs the Xorg runtime in the image and `/etc/X11/xorg.conf`, which are included in the standard build. If the session does not start, check the console output and `debug.log`.
 
-## Version
+## Project layout
 
-**YabroOS-32 0.0.2 Alpha**
-
-## Screenshot
-
-<img width="1280" height="801" alt="photo_2026-09-01_19-15-17" src="https://github.com/user-attachments/assets/3aae8f81-9bb7-4cbc-8590-80b1839287de" />
+| Path | Contents |
+| --- | --- |
+| `src/kernel/` | Kernel sources (C, Rust, assembly), VFS, memory management |
+| `src/user/` | YSH shell, YabrusBox, `startx`, `xinit` |
+| `limine-bin/` | Limine bootloader files |
+| `musl-port/` | musl sources and native build scripts |
+| `ports/` | Alpine Xorg runtime, `cwm`, musl ABI tests, Doom, TCC |
+| `build.sh`, `run.sh`, `clean.sh` | Build, run and clean scripts |
+| `limine.conf` | Boot configuration |
 

@@ -1,0 +1,7 @@
+NAME="YabroOS-32"
+PRETTY_NAME="YabroOS-32"
+ID=yabroos
+ID_LIKE=alpine
+VERSION_ID="0.47"
+VERSION="YabroOS-32"
+ANSI_COLOR="0;36"

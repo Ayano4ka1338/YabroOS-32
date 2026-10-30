@@ -1,4 +1,5 @@
 //Yabrus utils box - (c) Ayano4ka1338, 2026
+
 #include <stdint.h>
 #define SYS_read 0
 #define SYS_write 1
@@ -197,7 +198,7 @@ static int cmd_ls(int ac,char**av){
 	if(!targets) rc=ls_one(".",all,longfmt);
 	return rc;
 }
-static int cmd_pwd(void){char b[256];long n=sc2(SYS_getcwd,(long)b,sizeof(b));if(n<0)return 1;putn(b,n);put("\n");return 0;}
+static int cmd_pwd(void){char b[256];if(sc2(SYS_getcwd,(long)b,sizeof(b))<0){err("pwd","current directory");return 1;}put(b);put("\n");return 0;}
 static int cmd_mkdir(int ac,char**av){int rc=0;for(int i=2;i<ac;i++)if(sc2(SYS_mkdir,(long)av[i],0755)<0){err("mkdir",av[i]);rc=1;}return rc;}
 static const char *base_name_b(const char *p){const char *b=p?p:"";if(!p)return "";for(long i=0;p[i];i++)if(p[i]=='/')b=p+i+1;return b;}
 static int stat_is_dir_b(const char *p){struct kstat st;long r=sc2(SYS_stat,(long)p,(long)&st);return r==0 && ((st.mode&S_IFMT)==S_IFDIR);}
@@ -314,6 +315,20 @@ static const char *base_name(const char *p){
 	return b;
 }
 
+static void print_applet_list(void){
+	put("File tools:  ls cat mkdir rmdir cp mv rm touch head tail wc grep\n");
+	put("System:      uname uptime ps kill whoami id\n");
+	put("Shell tools: pwd echo env true false sh\n");
+}
+static void print_help(void){
+	put("YabrusBox 0.0.3-alpha - YabroOS-32 userland utilities\n\n");
+	put("Usage: yabrusbox APPLET [ARGS...]\n");
+	put("       APPLET [ARGS...]\n\n");
+	print_applet_list();
+	put("\nRun 'yabrusbox --list' to print the applet list.\n");
+	put("'cd' is built into YSH and must be run directly in the shell.\n");
+}
+
 static int is_applet_name(const char *c){
 	return eq(c,"ls")||eq(c,"cat")||eq(c,"pwd")||eq(c,"echo")||eq(c,"env")||
 		   eq(c,"mkdir")||eq(c,"rmdir")||eq(c,"cp")||eq(c,"rm")||eq(c,"mv")||
@@ -329,19 +344,22 @@ static int dispatch(int ac,char**av){
 		const char *b=base_name(av[0]);
 		if(is_applet_name(b) && !eq(b,"YABRUSBOX.ELF")){ applet=b; shift=0; }
 	}
+	if(!applet && ac>=2 && eq(av[1],"--version")){
+		put("YabrusBox 0.0.3-alpha (YabroOS-32)\n");return 0;
+	}
 	if(!applet && ac>=2 && (eq(av[1],"--help")||eq(av[1],"--list"))){
-		put("YabrusBox YabroOS-32 v0.0.2-alpha\n");
-		put("applets: ls cat pwd echo env mkdir rmdir cp rm mv touch head tail wc grep uname uptime ps kill whoami id true false sh\n");
+		if(eq(av[1],"--list")) print_applet_list(); else print_help();
 		return 0;
 	}
 	if(!applet && ac>=2 && (eq(av[0],"yabrusbox")||eq(av[0],"busybox")||eq(base_name(av[0]),"YABRUSBOX.ELF"))){
+		if(eq(av[1],"cd")){
+			put("yabrusbox: cd is a shell builtin; run 'cd DIRECTORY' directly in YSH.\n");
+			put("A child utility cannot change the working directory of its parent shell.\n");
+			return 2;
+		}
 		applet=av[1]; shift=1;
 	}
-	if(!applet){
-		put("YabrusBox YabroOS-32 v0.0.2-alpha\n");
-		put("applets: ls cat pwd echo env mkdir rmdir cp rm mv touch head tail wc grep uname uptime ps kill whoami id true false sh\n");
-		return 0;
-	}
+	if(!applet){print_help();return 0;}
 
 	char *args[16];
 	int outc=0;

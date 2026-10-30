@@ -1,4 +1,5 @@
 # System call entry path - (c) Ayano4ka1338, 2026
+
 .section .text
 .code64
 
@@ -7,6 +8,7 @@
 .global exec_enter_usermode
 .global syscall_handler
 .global syscall_isr_stub
+.global timer_isr_stub
 
 .extern syscall_dispatch
 .extern kernel_rsp
@@ -23,11 +25,14 @@
 .extern user_exit_pending
 .extern user_exec_pending
 .extern task_switch_pending
+.extern task_switch_deferred
 .extern task_return_ctx
+.extern task_commit_deferred_switch
 .extern vmm_user_switch
-.extern syscall_debug_iret_rip
-.extern syscall_debug_iret_rsp
-.extern syscall_debug_iret_cr3
+.extern syscall_return_audit
+.extern syscall_task_switch_audit
+.extern vmm_user_activate
+.extern timer_preempt_from_user
 
 .equ CTX_RAX,      0
 .equ CTX_RBX,      8
@@ -104,11 +109,6 @@ syscall_entry_asm:
 	movq syscall_user_cr3(%rip), %rdx
 
 
-
-	movq %rdi, syscall_debug_iret_rip(%rip)
-	movq %rsi, syscall_debug_iret_rsp(%rip)
-	movq %rdx, syscall_debug_iret_cr3(%rip)
-
 	jmp exec_enter_usermode_from_syscall
 
 .check_task_switch:
@@ -117,7 +117,17 @@ syscall_entry_asm:
 	movq $0, task_switch_pending(%rip)
 
 	movq task_return_ctx(%rip), %r15
+	movq %cr3, %rsi
+	movq %r15, %rdi
+	call syscall_task_switch_audit
 
+	cmpq $0, task_switch_deferred(%rip)
+	je .task_switch_regular
+	movq $0, task_switch_deferred(%rip)
+	movq %r15, %rdi
+	call task_commit_deferred_switch
+
+.task_switch_regular:
 	subq $40, %rsp
 	movq CTX_RIP(%r15), %rax
 	movq %rax, 0(%rsp)
@@ -131,7 +141,6 @@ syscall_entry_asm:
 	movq %rax, 32(%rsp)
 
 	movq CTX_FS_BASE(%r15), %rax
-	movl %eax, %eax
 	movq %rax, %r10
 	shrq $32, %r10
 	movl %r10d, %edx
@@ -139,13 +148,15 @@ syscall_entry_asm:
 	wrmsr
 
 	movq CTX_GS_BASE(%r15), %rax
-	movl %eax, %eax
 	movq %rax, %r10
 	shrq $32, %r10
 	movl %r10d, %edx
 	movl $0xC0000101, %ecx
 	wrmsr
 
+	movq CTX_CR3(%r15), %r14
+	movq %r14, %rdi
+	call vmm_user_activate
 	movq CTX_CR3(%r15), %r14
 	movq %r14, %cr3
 
@@ -191,6 +202,9 @@ syscall_entry_asm:
 	movq $0x2b, %rax
 	movq %rax, 184(%r15)
 
+	movq 144(%r15), %rsi
+	movq %r15, %rdi
+	call syscall_return_audit
 	movq 144(%r15), %rax
 	movq %rax, %cr3
 
@@ -211,6 +225,129 @@ syscall_entry_asm:
 
 	leaq 152(%r15), %rsp
 	movq 112(%r15), %r15
+	iretq
+
+timer_isr_stub:
+	cld
+
+	pushq %r15
+	pushq %r14
+	pushq %r13
+	pushq %r12
+	pushq %r11
+	pushq %r10
+	pushq %r9
+	pushq %r8
+	pushq %rbp
+	pushq %rdi
+	pushq %rsi
+	pushq %rdx
+	pushq %rcx
+	pushq %rbx
+	pushq %rax
+	movq %rsp, %r12
+	andq $-16, %rsp
+	movq %r12, %rdi
+	call timer_preempt_from_user
+	movq %r12, %rsp
+	testq %rax, %rax
+	jz .timer_restore_current
+
+	movq %rax, %r15
+	movq CTX_RAX(%r15), %rcx
+	movq %rcx, 0(%rsp)
+	movq CTX_RBX(%r15), %rcx
+	movq %rcx, 8(%rsp)
+	movq CTX_RCX(%r15), %rcx
+	movq %rcx, 16(%rsp)
+	movq CTX_RDX(%r15), %rcx
+	movq %rcx, 24(%rsp)
+	movq CTX_RSI(%r15), %rcx
+	movq %rcx, 32(%rsp)
+	movq CTX_RDI(%r15), %rcx
+	movq %rcx, 40(%rsp)
+	movq CTX_RBP(%r15), %rcx
+	movq %rcx, 48(%rsp)
+	movq CTX_R8(%r15),  %rcx
+	movq %rcx, 56(%rsp)
+	movq CTX_R9(%r15),  %rcx
+	movq %rcx, 64(%rsp)
+	movq CTX_R10(%r15), %rcx
+	movq %rcx, 72(%rsp)
+	movq CTX_R11(%r15), %rcx
+	movq %rcx, 80(%rsp)
+	movq CTX_R12(%r15), %rcx
+	movq %rcx, 88(%rsp)
+	movq CTX_R13(%r15), %rcx
+	movq %rcx, 96(%rsp)
+	movq CTX_R14(%r15), %rcx
+	movq %rcx, 104(%rsp)
+	movq CTX_R15(%r15), %rcx
+	movq %rcx, 112(%rsp)
+
+	movq CTX_RIP(%r15), %rcx
+	movq %rcx, 120(%rsp)
+	movq $0x23, %rcx
+	movq %rcx, 128(%rsp)
+	movq CTX_RFLAGS(%r15), %rcx
+	movq %rcx, 136(%rsp)
+	movq CTX_RSP(%r15), %rcx
+	movq %rcx, 144(%rsp)
+	movq $0x2b, %rcx
+	movq %rcx, 152(%rsp)
+
+	movq CTX_FS_BASE(%r15), %rax
+	movq %rax, %r10
+	shrq $32, %r10
+	movl %r10d, %edx
+	movl $0xC0000100, %ecx
+	wrmsr
+	movq CTX_GS_BASE(%r15), %rax
+	movq %rax, %r10
+	shrq $32, %r10
+	movl %r10d, %edx
+	movl $0xC0000101, %ecx
+	wrmsr
+
+	movq CTX_CR3(%r15), %r14
+	movq %r14, %rdi
+	call vmm_user_activate
+	movq CTX_CR3(%r15), %r14
+	movq %r14, %cr3
+
+	popq %rax
+	popq %rbx
+	popq %rcx
+	popq %rdx
+	popq %rsi
+	popq %rdi
+	popq %rbp
+	popq %r8
+	popq %r9
+	popq %r10
+	popq %r11
+	popq %r12
+	popq %r13
+	popq %r14
+	popq %r15
+	iretq
+
+.timer_restore_current:
+	popq %rax
+	popq %rbx
+	popq %rcx
+	popq %rdx
+	popq %rsi
+	popq %rdi
+	popq %rbp
+	popq %r8
+	popq %r9
+	popq %r10
+	popq %r11
+	popq %r12
+	popq %r13
+	popq %r14
+	popq %r15
 	iretq
 
 syscall_isr_stub:
@@ -273,6 +410,16 @@ exec_enter_usermode_common:
 	movq %rax, %fs
 	movq %rax, %gs
 
+	pushq %rdx
+	xorq %rax, %rax
+	xorl %edx, %edx
+	movl $0xC0000100, %ecx
+
+	wrmsr
+	movl $0xC0000101, %ecx
+	wrmsr
+
+	popq %rdx
 	movq %rdx, %rax
 	movq %rax, %cr3
 	iretq

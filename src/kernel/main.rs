@@ -1,5 +1,4 @@
 //Core Rust kernel services. - (c) Ayano4ka1338, 2026
-
 #![no_std]
 #![no_main]
 
@@ -24,6 +23,11 @@ extern "C" {
 	fn load_elf_with_args(data: *const u8, size: usize, exec_path: *const u8,
 						  argv: *const *const u8, argc: usize,
 						  envp: *const *const u8, envc: usize, stack_top: *mut u64) -> u64;
+	fn load_elf_with_args_reader(reader_ctx: *mut u8,
+						 reader: unsafe extern "C" fn(*mut u8, u64, *mut u8, u64) -> i64,
+						 size: u64, exec_path: *const u8,
+						 argv: *const *const u8, argc: usize,
+						 envp: *const *const u8, envc: usize, stack_top: *mut u64) -> u64;
 	fn vmm_user_cr3() -> u64;
 	fn vmm_user_map(virt: u64, phys: u64, flags: u64) -> i32;
 	fn vmm_user_unmap(virt: u64, phys_out: *mut u64) -> i32;
@@ -32,8 +36,13 @@ extern "C" {
 	fn pmm_hhdm_selftest() -> i32;
 	fn vfs_list_dir(path: *const u8, out: *mut u8, cap: usize) -> usize;
 	fn vfs_read_file(path: *const u8, out: *mut u8, cap: usize) -> usize;
+	fn vfs_lookup(path: *const u8) -> *mut u8;
+	fn vfs_file_is_regular(node: *const u8) -> i32;
+	fn vfs_file_data(node: *mut u8) -> *mut u8;
+	fn vfs_file_size(node: *const u8) -> u64;
 	fn vfs_import_boot_file(name: *const u8, size: u64) -> i32;
 	fn vfs_mkdir(path: *const u8, mode: u32) -> *mut u8;
+	fn bsod_reboot() -> !;
 }
 
 #[repr(C)]
@@ -220,8 +229,6 @@ unsafe fn debugcon_hex(mut v: u64) {
 	}
 	debugcon_str(&buf);
 }
-
-
 
 const CELL_W: usize = 8;
 const CELL_H: usize = 16;
@@ -450,6 +457,19 @@ static mut C_CONSOLE_FB_VIEW: LimineFramebuffer = LimineFramebuffer {
 };
 static mut C_CONSOLE_COL: usize = 0;
 static mut C_CONSOLE_ROW: usize = 0;
+static mut TTY_CURSOR_PHASE: bool = false;
+static mut TTY_CURSOR_VISIBLE: bool = false;
+static mut TTY_CURSOR_ENABLED: bool = true;
+static mut TTY_CURSOR_SAVED_COL: usize = 0;
+static mut TTY_CURSOR_SAVED_ROW: usize = 0;
+static mut TTY_CURSOR_SAVED_PIXELS: [u32; CELL_W] = [0; CELL_W];
+
+static mut TTY_ANSI_STATE: u8 = 0;                                                                       
+static mut TTY_ANSI_PARAMS: [usize; 8] = [0; 8];
+static mut TTY_ANSI_PARAM_COUNT: usize = 0;
+static mut TTY_ANSI_PRIVATE: bool = false;
+static mut TTY_SAVED_COL: usize = 0;
+static mut TTY_SAVED_ROW: usize = 0;
 
 extern "C" {
 	fn graphics_copy_to_user(dst_va: u64, src: *const u8, len: u64) -> i32;
@@ -472,7 +492,7 @@ pub extern "C" fn graphics_fb_info_kernel(out: *mut u64) -> i64 {
 		*out.add(2) = GFX_FB_PITCH;
 		*out.add(3) = GFX_FB_BPP;
 		*out.add(4) = GFX_FB_SIZE;
-		*out.add(5) = GFX_FB_PHYS & 0xfff;
+		*out.add(5) = GFX_FB_PHYS;
 		0
 	}
 }
@@ -519,11 +539,21 @@ pub extern "C" fn graphics_fb_map(virt: u64, off: u64, len: u64) -> i64 {
 			return -22;
 		}
 
-		let phys_offset = GFX_FB_PHYS & (PAGE - 1);
 		let phys = (GFX_FB_PHYS & !(PAGE - 1)).saturating_add(off);
-		let size = (len + phys_offset + PAGE - 1) & !(PAGE - 1);
+		let size = match len.checked_add(PAGE - 1) {
+			Some(v) => v & !(PAGE - 1),
+			None => return -22,
+		};
 
-		if off.checked_add(len).map_or(true, |end| end > GFX_FB_SIZE) {
+		let remaining = match (GFX_FB_PHYS & (PAGE - 1)).checked_add(GFX_FB_SIZE - off) {
+			Some(v) => v,
+			None => return -22,
+		};
+		let max_map_len = match remaining.checked_add(PAGE - 1) {
+			Some(v) => v & !(PAGE - 1),
+			None => return -22,
+		};
+		if size == 0 || size > max_map_len {
 			return -22;
 		}
 		if virt >= USER_TOP || size > USER_TOP - virt {
@@ -531,10 +561,14 @@ pub extern "C" fn graphics_fb_map(virt: u64, off: u64, len: u64) -> i64 {
 		}
 
 		let pages = size / PAGE;
+
+		const PTE_W_FB: u64 = 1 << 1;
+		const PTE_PWT_FB: u64 = 1 << 3;
+		const PTE_PCD_FB: u64 = 1 << 4;
+		const PTE_NX_FB: u64 = 1 << 63;
+		let fb_flags = PTE_W_FB | PTE_PWT_FB | PTE_PCD_FB | PTE_NX_FB;
 		for i in 0..pages {
-			if vmm_user_map(virt + i * PAGE, phys + i * PAGE, 0x1f) != 0 {
-
-
+			if vmm_user_map(virt + i * PAGE, phys + i * PAGE, fb_flags) != 0 {
 				for j in 0..i {
 					let mut old_phys = 0u64;
 					let _ = vmm_user_unmap(virt + j * PAGE, &mut old_phys);
@@ -560,8 +594,11 @@ pub extern "C" fn input_read_key() -> u64 {
 #[no_mangle]
 pub extern "C" fn console_fb_set_cursor(col: u64, row: u64) {
 	unsafe {
+		tty_cursor_restore();
 		C_CONSOLE_COL = col as usize;
 		C_CONSOLE_ROW = row as usize;
+		TTY_CURSOR_PHASE = true;
+		tty_cursor_draw();
 	}
 }
 
@@ -571,64 +608,485 @@ pub extern "C" fn console_fb_get_cursor() -> u64 {
 }
 
 #[no_mangle]
+pub extern "C" fn console_fb_get_size(rows: *mut u16, cols: *mut u16,
+                                        xpixel: *mut u16, ypixel: *mut u16) -> i32 {
+	unsafe {
+		if C_CONSOLE_FB.is_null() { return -1; }
+		let fb = &*C_CONSOLE_FB;
+		if !rows.is_null() { rows.write((fb.height as usize / CELL_H).min(u16::MAX as usize) as u16); }
+		if !cols.is_null() { cols.write((fb.width as usize / CELL_W).min(u16::MAX as usize) as u16); }
+		if !xpixel.is_null() { xpixel.write((fb.width as usize).min(u16::MAX as usize) as u16); }
+		if !ypixel.is_null() { ypixel.write((fb.height as usize).min(u16::MAX as usize) as u16); }
+		0
+	}
+}
+
+#[no_mangle]
+pub extern "C" fn console_fb_cls() {
+	unsafe {
+		tty_cursor_restore();
+		if C_CONSOLE_FB_VIEW.address.is_null() || C_CONSOLE_FB_VIEW.width == 0 ||
+		   C_CONSOLE_FB_VIEW.height == 0 {
+			C_CONSOLE_COL = 0;
+			C_CONSOLE_ROW = 0;
+			return;
+		}
+		clear_framebuffer(&C_CONSOLE_FB_VIEW);
+		C_CONSOLE_COL = 0;
+		C_CONSOLE_ROW = 0;
+		TTY_CURSOR_PHASE = true;
+		tty_cursor_draw();
+	}
+}
+
+#[inline(always)]
+unsafe fn bsod_pixel(fb: &LimineFramebuffer, x: usize, y: usize, color: u32) {
+    if x >= fb.width as usize || y >= fb.height as usize { return; }
+    let pitch_pixels = (fb.pitch / 4) as usize;
+    (fb.address as *mut u32).add(y * pitch_pixels + x).write_volatile(color);
+}
+
+unsafe fn bsod_fill(fb: &LimineFramebuffer, color: u32) {
+    let pitch_pixels = (fb.pitch / 4) as usize;
+    let ptr = fb.address as *mut u32;
+    for y in 0..fb.height as usize {
+        for x in 0..fb.width as usize {
+            ptr.add(y * pitch_pixels + x).write_volatile(color);
+        }
+    }
+}
+
+unsafe fn bsod_char(fb: &LimineFramebuffer, ch: u8, x: usize, y: usize, color: u32) {
+    if x + CELL_W > fb.width as usize || y + CELL_H > fb.height as usize { return; }
+    let fb_ptr = fb.address as *mut u32;
+    let pitch_pixels = (fb.pitch / 4) as usize;
+    let font_idx = if ch >= 32 && ch <= 127 { ((ch - 32) as usize) * GLYPH_BYTES } else { 0 };
+    for dy in 0..CELL_H {
+        let row = FONT[font_idx + dy];
+        for dx in 0..CELL_W {
+            if (row & (1 << (7 - dx))) != 0 {
+                fb_ptr.add((y + dy) * pitch_pixels + x + dx).write_volatile(color);
+            }
+        }
+    }
+}
+
+unsafe fn bsod_text(fb: &LimineFramebuffer, text: &[u8], x: usize, y: usize, color: u32) {
+    let mut cx = x;
+    for &ch in text {
+        if ch == b'\n' { break; }
+        bsod_char(fb, ch, cx, y, color);
+        cx += CELL_W;
+        if cx + CELL_W > fb.width as usize { break; }
+    }
+}
+
+unsafe fn bsod_hex_line(fb: &LimineFramebuffer, label: &[u8], value: u64, x: usize, y: usize, color: u32) {
+    bsod_text(fb, label, x, y, color);
+    let mut cx = x + label.len() * CELL_W;
+    bsod_text(fb, b"0x", cx, y, color);
+    cx += 2 * CELL_W;
+    let hex = b"0123456789ABCDEF";
+    for i in (0..16).rev() {
+        let nib = ((value >> (i * 4)) & 0xF) as usize;
+        bsod_char(fb, hex[nib], cx, y, color);
+        cx += CELL_W;
+    }
+}
+
+unsafe fn bsod_center_text(fb: &LimineFramebuffer, text: &[u8], y: usize, color: u32) {
+    let cols = (fb.width as usize) / CELL_W;
+    let len = text.len().min(cols);
+    let x = ((cols.saturating_sub(len)) / 2) * CELL_W;
+    bsod_text(fb, &text[..len], x, y, color);
+}
+
+unsafe fn bsod_center_hex_line(fb: &LimineFramebuffer, label: &[u8], value: u64, y: usize, color: u32) {
+    let total = label.len() + 2 + 16;
+    let cols = (fb.width as usize) / CELL_W;
+    let x = ((cols.saturating_sub(total)) / 2) * CELL_W;
+    bsod_hex_line(fb, label, value, x, y, color);
+}
+
+unsafe fn bsod_title_tab(fb: &LimineFramebuffer, text: &[u8], y: usize, bg: u32, tab: u32) {
+    let cols = (fb.width as usize) / CELL_W;
+    let len = text.len().min(cols.saturating_sub(2));
+    let text_w = len * CELL_W;
+    let tab_w = text_w + CELL_W * 2;
+    let left = ((fb.width as usize).saturating_sub(tab_w)) / 2;
+
+    for yy in y.saturating_sub(2)..(y + CELL_H + 2) {
+        for xx in left..(left + tab_w).min(fb.width as usize) {
+            bsod_pixel(fb, xx, yy, tab);
+        }
+    }
+
+    let text_x = left + CELL_W;
+    bsod_text(fb, &text[..len], text_x, y, bg);
+}
+
+#[no_mangle]
+pub extern "C" fn bsod_page_fault(rip: u64, cr3: u64, cr2: u64, error: u64) -> ! {
+    unsafe {
+        if C_CONSOLE_FB_VIEW.address.is_null() || C_CONSOLE_FB_VIEW.width == 0 || C_CONSOLE_FB_VIEW.height == 0 {
+            loop { asm!("cli; hlt"); }
+        }
+
+        let fb = &C_CONSOLE_FB_VIEW;
+
+        let bg = 0x00_00_00_AA_u32;
+        let white = 0x00_FF_FF_FF_u32;
+        let tab = 0x00_C0_C0_C0_u32;
+        bsod_fill(fb, bg);
+
+        let rows = (fb.height as usize) / CELL_H;
+        let center_y = rows / 2;
+
+        let title_y = center_y.saturating_sub(9) * CELL_H;
+        bsod_title_tab(fb, b"YabroOS-32", title_y, bg, tab);
+
+        let mut y = title_y + CELL_H * 3;
+        bsod_center_text(fb, b"A fatal page fault has occurred.", y, white);
+        y += CELL_H * 2;
+
+        bsod_center_hex_line(fb, b"RIP:   ", rip, y, white);
+        y += CELL_H;
+        bsod_center_hex_line(fb, b"CR3:   ", cr3, y, white);
+        y += CELL_H;
+        bsod_center_hex_line(fb, b"CR2:   ", cr2, y, white);
+        y += CELL_H;
+        bsod_center_hex_line(fb, b"ERROR: ", error, y, white);
+        y += CELL_H * 2;
+
+        bsod_center_text(fb, b"The kernel cannot safely continue.", y, white);
+        y += CELL_H * 2;
+
+        bsod_center_text(fb, b"* Press any key to reboot the computer.", y, white);
+        y += CELL_H;
+        bsod_center_text(fb, b"* The kernel stopped after an unrecoverable page fault.", y, white);
+        y += CELL_H * 2;
+        bsod_center_text(fb, b"* Check the debug log for more information.", y, white);
+
+        bsod_center_text(fb, b"Press any key to reboot", (center_y + 7) * CELL_H, white);
+
+        C_CONSOLE_COL = 0;
+        C_CONSOLE_ROW = 0;
+
+        asm!("sti", options(nomem, nostack));
+        loop {
+            if get_key() != 0 {
+                bsod_reboot();
+            }
+            asm!("hlt", options(nomem, nostack));
+        }
+    }
+}
+unsafe fn tty_cursor_restore() {
+	if !TTY_CURSOR_VISIBLE || C_CONSOLE_FB.is_null() { return; }
+	let fb=&*C_CONSOLE_FB;
+	let pitch=(fb.pitch/4) as usize;
+	let x0=TTY_CURSOR_SAVED_COL*CELL_W;
+	let y0=TTY_CURSOR_SAVED_ROW*CELL_H+(CELL_H-1);
+	if x0+CELL_W>fb.width as usize || y0+1>fb.height as usize { TTY_CURSOR_VISIBLE=false; return; }
+	let ptr=fb.address as *mut u32;
+	for y in 0..1 {
+		for x in 0..CELL_W {
+			let idx=y*CELL_W+x;
+			ptr.add((y0+y)*pitch+x0+x).write_volatile(TTY_CURSOR_SAVED_PIXELS[idx]);
+		}
+	}
+	TTY_CURSOR_VISIBLE=false;
+}
+
+unsafe fn tty_cursor_draw() {
+	if !TTY_CURSOR_ENABLED || C_CONSOLE_FB.is_null() { return; }
+	let fb=&*C_CONSOLE_FB;
+	let cols=(fb.width as usize)/CELL_W;
+	let rows=(fb.height as usize)/CELL_H;
+	if cols==0 || rows==0 { return; }
+	let col=cmp::min(C_CONSOLE_COL,cols-1);
+	let row=cmp::min(C_CONSOLE_ROW,rows-1);
+	let x0=col*CELL_W;
+	let y0=row*CELL_H+(CELL_H-1);
+	if x0+CELL_W>fb.width as usize || y0+1>fb.height as usize { return; }
+	let pitch=(fb.pitch/4) as usize;
+	let ptr=fb.address as *mut u32;
+	for y in 0..1 {
+		for x in 0..CELL_W {
+			let idx=y*CELL_W+x;
+			let off=(y0+y)*pitch+x0+x;
+			TTY_CURSOR_SAVED_PIXELS[idx]=ptr.add(off).read_volatile();
+			ptr.add(off).write_volatile(0x00_FF_FF_FF);
+		}
+	}
+	TTY_CURSOR_SAVED_COL=col;
+	TTY_CURSOR_SAVED_ROW=row;
+	TTY_CURSOR_VISIBLE=true;
+}
+
+#[no_mangle]
+pub extern "C" fn console_fb_cursor_suspend() {
+	unsafe {
+
+		tty_cursor_restore();
+		TTY_CURSOR_VISIBLE = false;
+		TTY_CURSOR_PHASE = false;
+	}
+}
+
+#[no_mangle]
+pub extern "C" fn console_fb_cursor_blink_tick() {
+	unsafe {
+		if !TTY_CURSOR_ENABLED { tty_cursor_restore(); TTY_CURSOR_PHASE = false; return; }
+		TTY_CURSOR_PHASE=!TTY_CURSOR_PHASE;
+		if TTY_CURSOR_PHASE {
+			if !TTY_CURSOR_VISIBLE { tty_cursor_draw(); }
+		} else {
+			tty_cursor_restore();
+		}
+	}
+}
+
+unsafe fn tty_param(index: usize, default: usize) -> usize {
+	if index >= TTY_ANSI_PARAM_COUNT { return default; }
+	let value = TTY_ANSI_PARAMS[index];
+	if value == 0 { default } else { value }
+}
+
+unsafe fn tty_clear_cells(fb: &LimineFramebuffer, cols: usize,
+                          row: usize, first: usize, last: usize) {
+	if row >= (fb.height as usize / CELL_H) { return; }
+	let stop = cmp::min(last, cols);
+	for col in first..stop {
+		draw_char(fb, b' ', col, row);
+	}
+}
+
+unsafe fn tty_clear_screen(fb: &LimineFramebuffer, cols: usize, rows: usize) {
+	for row in 0..rows { tty_clear_cells(fb, cols, row, 0, cols); }
+}
+
+unsafe fn tty_shift_row(fb: &LimineFramebuffer, cols: usize, row: usize,
+                        col: usize, count: usize, insert: bool) {
+	if row >= (fb.height as usize / CELL_H) || col >= cols || count == 0 { return; }
+	let shift = cmp::min(count, cols - col) * CELL_W;
+	let left = col * CELL_W;
+	let right = cols * CELL_W;
+	if shift == 0 || left >= right { return; }
+	let pitch = (fb.pitch / 4) as usize;
+	let ptr = fb.address as *mut u32;
+	for dy in 0..CELL_H {
+		let y = row * CELL_H + dy;
+		if insert {
+			for x in (left..right - shift).rev() {
+				let pixel = ptr.add(y * pitch + x).read_volatile();
+				ptr.add(y * pitch + x + shift).write_volatile(pixel);
+			}
+		} else {
+			for x in left..right - shift {
+				let pixel = ptr.add(y * pitch + x + shift).read_volatile();
+				ptr.add(y * pitch + x).write_volatile(pixel);
+			}
+		}
+	}
+	if insert { tty_clear_cells(fb, cols, row, col, cmp::min(col + count, cols)); }
+	else { tty_clear_cells(fb, cols, row, cols - (shift / CELL_W), cols); }
+}
+
+unsafe fn tty_shift_lines(fb: &LimineFramebuffer, cols: usize, rows: usize,
+                          row: usize, count: usize, insert: bool) {
+	if row >= rows || count == 0 { return; }
+	let amount = cmp::min(count, rows - row);
+	let shift = amount * CELL_H;
+	let start_y = row * CELL_H;
+	let end_y = rows * CELL_H;
+	let width = cols * CELL_W;
+	let pitch = (fb.pitch / 4) as usize;
+	let ptr = fb.address as *mut u32;
+	if insert {
+		for y in (start_y..end_y - shift).rev() {
+			for x in 0..width {
+				let pixel = ptr.add(y * pitch + x).read_volatile();
+				ptr.add((y + shift) * pitch + x).write_volatile(pixel);
+			}
+		}
+		for r in row..row + amount { tty_clear_cells(fb, cols, r, 0, cols); }
+	} else {
+		for y in start_y..end_y - shift {
+			for x in 0..width {
+				let pixel = ptr.add((y + shift) * pitch + x).read_volatile();
+				ptr.add(y * pitch + x).write_volatile(pixel);
+			}
+		}
+		for r in rows - amount..rows { tty_clear_cells(fb, cols, r, 0, cols); }
+	}
+}
+
+unsafe fn tty_csi_execute(fb: &LimineFramebuffer, cols: usize, rows: usize, final_byte: u8) {
+	let n = tty_param(0, 1);
+	match final_byte {
+		b'A' => C_CONSOLE_ROW = C_CONSOLE_ROW.saturating_sub(n),
+		b'B' => C_CONSOLE_ROW = cmp::min(C_CONSOLE_ROW.saturating_add(n), rows.saturating_sub(1)),
+		b'C' => C_CONSOLE_COL = cmp::min(C_CONSOLE_COL.saturating_add(n), cols.saturating_sub(1)),
+		b'D' => C_CONSOLE_COL = C_CONSOLE_COL.saturating_sub(n),
+		b'E' => { C_CONSOLE_ROW = cmp::min(C_CONSOLE_ROW.saturating_add(n), rows.saturating_sub(1)); C_CONSOLE_COL = 0; },
+		b'F' => { C_CONSOLE_ROW = C_CONSOLE_ROW.saturating_sub(n); C_CONSOLE_COL = 0; },
+		b'G' => C_CONSOLE_COL = cmp::min(tty_param(0, 1).saturating_sub(1), cols.saturating_sub(1)),
+		b'd' => C_CONSOLE_ROW = cmp::min(tty_param(0, 1).saturating_sub(1), rows.saturating_sub(1)),
+		b'H' | b'f' => {
+			C_CONSOLE_ROW = cmp::min(tty_param(0, 1).saturating_sub(1), rows.saturating_sub(1));
+			C_CONSOLE_COL = cmp::min(tty_param(1, 1).saturating_sub(1), cols.saturating_sub(1));
+		},
+		b'J' => {
+			match TTY_ANSI_PARAMS[0] {
+				0 => {
+					tty_clear_cells(fb, cols, C_CONSOLE_ROW, C_CONSOLE_COL, cols);
+					for row in (C_CONSOLE_ROW + 1)..rows { tty_clear_cells(fb, cols, row, 0, cols); }
+				},
+				1 => {
+					for row in 0..C_CONSOLE_ROW { tty_clear_cells(fb, cols, row, 0, cols); }
+					tty_clear_cells(fb, cols, C_CONSOLE_ROW, 0, cmp::min(C_CONSOLE_COL + 1, cols));
+				},
+				2 | 3 => tty_clear_screen(fb, cols, rows),
+				_ => {},
+			}
+		},
+		b'K' => {
+			match TTY_ANSI_PARAMS[0] {
+				0 => tty_clear_cells(fb, cols, C_CONSOLE_ROW, C_CONSOLE_COL, cols),
+				1 => tty_clear_cells(fb, cols, C_CONSOLE_ROW, 0, cmp::min(C_CONSOLE_COL + 1, cols)),
+				2 => tty_clear_cells(fb, cols, C_CONSOLE_ROW, 0, cols),
+				_ => {},
+			}
+		},
+		b'X' => tty_clear_cells(fb, cols, C_CONSOLE_ROW, C_CONSOLE_COL,
+			cmp::min(C_CONSOLE_COL.saturating_add(n), cols)),
+		b'@' => tty_shift_row(fb, cols, C_CONSOLE_ROW, C_CONSOLE_COL, n, true),
+		b'P' => tty_shift_row(fb, cols, C_CONSOLE_ROW, C_CONSOLE_COL, n, false),
+		b'L' => tty_shift_lines(fb, cols, rows, C_CONSOLE_ROW, n, true),
+		b'M' => tty_shift_lines(fb, cols, rows, C_CONSOLE_ROW, n, false),
+		b'S' => tty_shift_lines(fb, cols, rows, 0, n, false),
+		b'T' => tty_shift_lines(fb, cols, rows, 0, n, true),
+		b's' => { TTY_SAVED_COL = C_CONSOLE_COL; TTY_SAVED_ROW = C_CONSOLE_ROW; },
+		b'u' => { C_CONSOLE_COL = cmp::min(TTY_SAVED_COL, cols.saturating_sub(1)); C_CONSOLE_ROW = cmp::min(TTY_SAVED_ROW, rows.saturating_sub(1)); },
+		b'h' | b'l' if TTY_ANSI_PRIVATE => {
+			let enable = final_byte == b'h';
+			for i in 0..TTY_ANSI_PARAM_COUNT {
+				match TTY_ANSI_PARAMS[i] {
+					25 => {
+						TTY_CURSOR_ENABLED = enable;
+						if !enable { tty_cursor_restore(); TTY_CURSOR_PHASE = false; }
+					},
+
+					1049 | 47 => {
+						tty_clear_screen(fb, cols, rows);
+						C_CONSOLE_COL = 0;
+						C_CONSOLE_ROW = 0;
+
+						if !enable { TTY_CURSOR_ENABLED = true; TTY_CURSOR_PHASE = true; }
+					},
+					_ => {},
+				}
+			}
+			if enable { TTY_CURSOR_PHASE = true; }
+		},
+
+		b'm' | b'r' | b'n' | b'c' | b't' => {},
+		_ => {},
+	}
+}
+
+#[no_mangle]
 pub extern "C" fn console_fb_putc(ch: u8) {
 	unsafe {
-		if C_CONSOLE_FB.is_null() {
-			return;
-		}
-
+		tty_cursor_restore();
+		if C_CONSOLE_FB.is_null() { return; }
 		let fb = &*C_CONSOLE_FB;
-		static mut FB_AUDIT_ONCE: bool = false;
-		if !FB_AUDIT_ONCE {
-			FB_AUDIT_ONCE = true;
-			debugcon_str(b"[FB-AUDIT] addr=0x"); debugcon_hex(fb.address as u64);
-			debugcon_str(b" width=0x"); debugcon_hex(fb.width);
-			debugcon_str(b" height=0x"); debugcon_hex(fb.height);
-			debugcon_str(b" pitch=0x"); debugcon_hex(fb.pitch);
-			debugcon_str(b" bpp=0x"); debugcon_hex(fb.bpp as u64);
-			debugcon_str(b"\n");
-		}
-
-		let fb_addr = fb.address as u64;
-		if fb_addr < 0x0001_0000 {
-			debugcon_str(b"[FB-AUDIT] INVALID-LOW-ADDRESS\n");
-			return;
-		}
-
-		let max_cols = (fb.width as usize / CELL_W);
+		if (fb.address as u64) < 0x0001_0000 { return; }
+		let max_cols = fb.width as usize / CELL_W;
 		let max_rows = fb.height as usize / CELL_H;
-		if max_cols == 0 || max_rows == 0 {
-			return;
-		}
+		if max_cols == 0 || max_rows == 0 { return; }
 
-		match ch {
-			b'\r' => {
-				C_CONSOLE_COL = 0;
-			}
-			b'\n' => {
-				C_CONSOLE_COL = 0;
-				C_CONSOLE_ROW += 1;
-			}
-			8 => {
-				if C_CONSOLE_COL > 0 {
-					C_CONSOLE_COL -= 1;
-					draw_char(fb, b' ', C_CONSOLE_COL, C_CONSOLE_ROW);
+		match TTY_ANSI_STATE {
+			1 => {          
+				TTY_ANSI_STATE = 0;
+				match ch {
+					b'[' => { TTY_ANSI_STATE = 2; TTY_ANSI_PARAMS = [0; 8]; TTY_ANSI_PARAM_COUNT = 1; TTY_ANSI_PRIVATE = false; },
+
+					b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' | b'#' | b'%' => TTY_ANSI_STATE = 3,
+
+					b']' | b'P' | b'X' | b'^' | b'_' => TTY_ANSI_STATE = 4,
+					b'7' => { TTY_SAVED_COL = C_CONSOLE_COL; TTY_SAVED_ROW = C_CONSOLE_ROW; },
+					b'8' => { C_CONSOLE_COL = cmp::min(TTY_SAVED_COL, max_cols - 1); C_CONSOLE_ROW = cmp::min(TTY_SAVED_ROW, max_rows - 1); },
+					b'c' => { tty_clear_screen(fb, max_cols, max_rows); C_CONSOLE_COL = 0; C_CONSOLE_ROW = 0; },
+					b'D' => { C_CONSOLE_ROW += 1; },
+					b'M' => { C_CONSOLE_ROW = C_CONSOLE_ROW.saturating_sub(1); },
+					b'\\' => {},
+					0x20..=0x2f => TTY_ANSI_STATE = 3,
+					_ => {},                                                              
 				}
-			}
+			},
+			2 => {                                                             
+				if ch >= b'0' && ch <= b'9' {
+					let idx = cmp::min(TTY_ANSI_PARAM_COUNT.saturating_sub(1), 7);
+					TTY_ANSI_PARAMS[idx] = cmp::min(TTY_ANSI_PARAMS[idx].saturating_mul(10).saturating_add((ch - b'0') as usize), 65535);
+				} else if ch == b';' {
+					if TTY_ANSI_PARAM_COUNT < 8 { TTY_ANSI_PARAM_COUNT += 1; }
+				} else if (0x3c..=0x3f).contains(&ch) {
+
+					TTY_ANSI_PRIVATE = true;
+				} else if (0x20..=0x2f).contains(&ch) {
+
+				} else if (0x40..=0x7e).contains(&ch) {
+					tty_csi_execute(fb, max_cols, max_rows, ch);
+					TTY_ANSI_STATE = 0;
+				} else if ch < 0x20 {
+
+				} else {
+					TTY_ANSI_STATE = 0;
+				}
+			},
+			3 => {                                                                      
+				TTY_ANSI_STATE = 0;
+			},
+			4 => {                                                              
+				if ch == 0x07 { TTY_ANSI_STATE = 0; }
+				else if ch == 0x1b { TTY_ANSI_STATE = 5; }
+			},
+			5 => {                                               
+				if ch == b'\\' { TTY_ANSI_STATE = 0; }
+				else if ch != 0x1b { TTY_ANSI_STATE = 4; }
+			},
 			_ => {
-				draw_char(fb, ch, C_CONSOLE_COL, C_CONSOLE_ROW);
-				C_CONSOLE_COL += 1;
-				if C_CONSOLE_COL >= max_cols {
-					C_CONSOLE_COL = 0;
-					C_CONSOLE_ROW += 1;
+				if ch == 0x1b {
+					TTY_ANSI_STATE = 1;
+				} else {
+					match ch {
+						b'\r' => C_CONSOLE_COL = 0,
+						b'\n' => { C_CONSOLE_COL = 0; C_CONSOLE_ROW += 1; },
+						b'\t' => C_CONSOLE_COL = cmp::min((C_CONSOLE_COL + 8) & !7, max_cols - 1),
+						8 | 127 => {
+							if C_CONSOLE_COL > 0 { C_CONSOLE_COL -= 1; draw_char(fb, b' ', C_CONSOLE_COL, C_CONSOLE_ROW); }
+						},
+						0..=31 => {},
+					_ => {
+						if C_CONSOLE_ROW < max_rows && C_CONSOLE_COL < max_cols {
+							draw_char(fb, ch, C_CONSOLE_COL, C_CONSOLE_ROW);
+						}
+						C_CONSOLE_COL += 1;
+						if C_CONSOLE_COL >= max_cols { C_CONSOLE_COL = 0; C_CONSOLE_ROW += 1; }
+					}
+					}
 				}
 			}
 		}
-
 		if C_CONSOLE_ROW >= max_rows {
 			scroll_screen(fb, max_cols, max_rows);
 			C_CONSOLE_ROW = max_rows - 1;
 		}
+		C_CONSOLE_COL = cmp::min(C_CONSOLE_COL, max_cols - 1);
+		TTY_CURSOR_PHASE = true;
+		if TTY_CURSOR_ENABLED { tty_cursor_draw(); }
 	}
 }
 
@@ -673,10 +1131,12 @@ unsafe fn draw_cursor(fb: &LimineFramebuffer, col: usize, row: usize, show: bool
 }
 
 unsafe fn clear_framebuffer(fb: &LimineFramebuffer) {
-	let pixels = (fb.width * fb.height) as usize;
+	let pitch_pixels = (fb.pitch / 4) as usize;
 	let fb_ptr = fb.address as *mut u32;
-	for i in 0..pixels {
-		fb_ptr.add(i).write_volatile(0x00_00_00_00);
+	for y in 0..fb.height as usize {
+		for x in 0..fb.width as usize {
+			fb_ptr.add(y * pitch_pixels + x).write_volatile(0x00_00_00_00);
+		}
 	}
 }
 
@@ -840,6 +1300,15 @@ struct DirectoryEntry {
 	last_write_date: u16,
 	first_cluster_low: u16,
 	file_size: u32,
+}
+
+#[repr(C)]
+struct ExecReadContext {
+	kind: u32,                                                   
+	reserved: u32,
+	data: *const u8,
+	size: u64,
+	fat_entry: DirectoryEntry,
 }
 
 #[repr(packed)]
@@ -1082,6 +1551,31 @@ unsafe fn find_file_in_root(path: *const u8) -> Option<DirectoryEntry> {
 	None
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn bootfs_path_is_dir(path: *const u8) -> i32 {
+	if path.is_null() { return 0; }
+	let mut raw=[0u8;260];
+	let n=fat_path_components(path,&mut raw);
+	if n==0 { return 0; }
+	let mut cur_cluster=FAT32_ROOT_CLUSTER;
+	let mut pos=0usize;
+	while pos<n {
+		while pos<n && raw[pos]==b'/' { pos+=1; }
+		if pos>=n { return 1; }
+		let begin=pos;
+		while pos<n && raw[pos]!=b'/' { pos+=1; }
+		let component=&raw[begin..pos];
+		if component.is_empty() { continue; }
+		let entry=match find_entry_in_directory(cur_cluster,component) { Some(e)=>e, None=>return 0 };
+		let is_last={ let mut q=pos; while q<n && raw[q]==b'/' { q+=1; } q>=n };
+		if is_last { return if (entry.attributes & 0x10)!=0 {1} else {0}; }
+		if (entry.attributes & 0x10)==0 { return 0; }
+		cur_cluster=((entry.first_cluster_high as u32)<<16)|(entry.first_cluster_low as u32);
+		if cur_cluster==0 || !fat_cluster_valid(cur_cluster) { return 0; }
+	}
+	0
+}
+
 unsafe fn get_file_size_by_name(name: &[u8]) -> usize {
 	let mut p=[0u8; 260];
 	if name.len()+1 > p.len() { return 0; }
@@ -1191,6 +1685,29 @@ unsafe fn read_file_range_by_entry(entry: &DirectoryEntry, offset: usize, buffer
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn kernel_execve_source_read(
+	ctx: *mut u8, offset: u64, dst: *mut u8, len: u64,
+) -> i64 {
+	if ctx.is_null() || (dst.is_null() && len != 0) { return -14; }
+	let source = &*(ctx as *const ExecReadContext);
+	if offset > source.size || len > source.size - offset || len > usize::MAX as u64 {
+		return -5;
+	}
+	if len == 0 { return 0; }
+	let n = len as usize;
+	if source.kind == 0 {
+		if source.data.is_null() { return -5; }
+		ptr::copy_nonoverlapping(source.data.add(offset as usize), dst, n);
+		n as i64
+	} else if source.kind == 1 {
+		let out = slice::from_raw_parts_mut(dst, n);
+		read_file_range_by_entry(&source.fat_entry, offset as usize, out) as i64
+	} else {
+		-5
+	}
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn bootfs_read_root_file(path: *const u8, offset: u64, dst: *mut u8, len: usize) -> usize {
 	if dst.is_null() || len==0 { return 0; }
 	let entry=match find_file_in_root(path){Some(e)=>e,None=>return 0};
@@ -1280,27 +1797,63 @@ pub unsafe extern "C" fn kernel_execve_file_args(path: *const u8,
 		return -14;
 	}
 
-	let entry=match find_file_in_root(path) { Some(e)=>e, None=>return -2 };
-
-	static mut EXEC_IMAGE: [u8; 4 * 1024 * 1024] = [0u8; 4 * 1024 * 1024];
-
-	let image_ptr = core::ptr::addr_of_mut!(EXEC_IMAGE) as *mut u8;
-	let image = core::slice::from_raw_parts_mut(image_ptr, 4 * 1024 * 1024);
-
-	let file_size = entry.file_size as usize;
-	if file_size == 0 || file_size > image.len() {
-		return -8;
+	let mut exec_path = [0u8; 260];
+	let mut src_pos = 0usize;
+	let mut path_len = 0usize;
+	let mut path_terminated = false;
+	if *path != b'/' {
+		exec_path[0] = b'/';
+		path_len = 1;
 	}
-
-	let read_size = read_file_range_by_entry(&entry,0,&mut image[..file_size]);
-	if read_size != file_size {
-		return -8;
+	while path_len + 1 < exec_path.len() {
+		let c = *path.add(src_pos);
+		if c == 0 {
+			path_terminated = true;
+			break;
+		}
+		exec_path[path_len] = c;
+		path_len += 1;
+		src_pos += 1;
 	}
+	if !path_terminated { return -36; }                   
+	exec_path[path_len] = 0;
 
-	let size = file_size;
+	const MAX_EXEC_FILE: u64 = 128 * 1024 * 1024;
+	let mut source = ExecReadContext {
+		kind: 0,
+		reserved: 0,
+		data: core::ptr::null(),
+		size: 0,
+		fat_entry: unsafe { core::mem::zeroed() },
+	};
+	let file_size: u64;
+	if let Some(fat_entry) = find_file_in_root(exec_path.as_ptr()) {
+		file_size = fat_entry.file_size as u64;
+		if file_size == 0 || file_size > MAX_EXEC_FILE { return -8; }
+		source.kind = 1;
+		source.size = file_size;
+		source.fat_entry = fat_entry;
+	} else {
+		let vnode = vfs_lookup(exec_path.as_ptr());
+		if vnode.is_null() || vfs_file_is_regular(vnode as *const u8) != 1 {
+			return -2;
+		}
+		file_size = vfs_file_size(vnode as *const u8);
+		if file_size == 0 || file_size > MAX_EXEC_FILE { return -8; }
+		let data = vfs_file_data(vnode);
+		if data.is_null() { return -8; }
+		source.kind = 0;
+		source.data = data as *const u8;
+		source.size = file_size;
+	}
 
 	let mut stack_top = 0u64;
-	let entry = load_elf_with_args(image.as_ptr(), size, path, argv, argc, envp, envc, &mut stack_top);
+	let entry = load_elf_with_args_reader(
+		(&mut source as *mut ExecReadContext).cast::<u8>(),
+		kernel_execve_source_read,
+		file_size,
+		exec_path.as_ptr(), argv, argc, envp, envc, &mut stack_top,
+	);
 	if entry == 0 { return -8; }
 	*entry_out = entry;
 	*stack_out = stack_top;
@@ -1393,6 +1946,38 @@ pub extern "C" fn kernel_main() -> ! {
 				(0, 0)
 			};
 			pmm_init(mm.entries, mm.entry_count, hhdm, kernel_base, kernel_end);
+
+			if !MODULE_REQUEST.response.is_null() {
+				let module_response = &*MODULE_REQUEST.response;
+				let modules = slice::from_raw_parts(
+					module_response.modules as *const *mut LimineFile,
+					module_response.module_count as usize
+				);
+				for &mod_ptr in modules {
+					if mod_ptr.is_null() { continue; }
+					let module = &*mod_ptr;
+					let raw = module.address as u64;
+					let size = module.size;
+					if size == 0 {
+									continue;
+					}
+
+					let module_phys = if raw >= hhdm && raw - hhdm < (1u64 << 52) {
+						raw - hhdm
+					} else if raw < (1u64 << 52) {
+						raw
+					} else {
+						debugcon_str(b"[PMM] cannot normalize Limine module address\n");
+							continue;
+					};
+					if module_phys >= (1u64 << 52) || size > (1u64 << 52) - module_phys {
+						debugcon_str(b"[PMM] invalid Limine module physical range\n");
+								continue;
+					}
+					pmm_reserve_range(module_phys, size);
+				}
+			}
+
 			if !FRAMEBUFFER_REQUEST.response.is_null() {
 				let fb_resp = &*FRAMEBUFFER_REQUEST.response;
 				if fb_resp.framebuffer_count > 0 && !fb_resp.framebuffers.is_null() {
@@ -1406,15 +1991,10 @@ pub extern "C" fn kernel_main() -> ! {
 						raw
 					};
 					pmm_reserve_range(fb_phys, fb_size);
-					debugcon_str(b"[PMM] framebuffer raw=0x");
-					debugcon_hex(raw);
-					debugcon_str(b"[PMM] reserved framebuffer phys=0x");
-					debugcon_hex(fb_phys);
-					debugcon_str(b"[PMM] reserved framebuffer size=0x");
-					debugcon_hex(fb_size);
 				}
 			}
 			if pmm_hhdm_selftest() != 0 {
+				debugcon_str(b"[BOOT] HHDM self-test FAILED; halted\n");
 				loop { asm!("cli; hlt"); }
 			}
 		}
@@ -1441,10 +2021,6 @@ pub extern "C" fn kernel_main() -> ! {
 		GFX_FB_BPP = fb.bpp as u64;
 		let fb_virt = hhdm.saturating_add(fb_phys);
 
-		debugcon_str(b"[FB-ADDR] raw=0x"); debugcon_hex(fb_raw);
-		debugcon_str(b"[FB-ADDR] hhdm=0x"); debugcon_hex(hhdm);
-		debugcon_str(b"[FB-ADDR] phys=0x"); debugcon_hex(fb_phys);
-		debugcon_str(b"[FB-ADDR] kernel_va=0x"); debugcon_hex(fb_virt);
 
 		C_CONSOLE_FB_VIEW.address = fb_virt as *mut u8;
 		C_CONSOLE_FB_VIEW.width = fb.width;
@@ -1519,7 +2095,33 @@ pub extern "C" fn kernel_main() -> ! {
 
 		let welcome = b"Welcome to YabroOS-32 Shell\nType 'help' for available commands\n\n";
 		print_str(welcome, &mut col, &mut row);
-		let prompt = b"YabroOS-32> ";
+
+		unsafe {
+			let ysh_path = b"/YSH.ELF\0";
+			let argv0 = b"/YSH.ELF\0";
+			let env0 = b"PATH=/\0";
+			let env1 = b"HOME=/\0";
+			let env2 = b"SHELL=/bin/sh\0";
+			let argv = [argv0.as_ptr(), core::ptr::null()];
+			let envp = [env0.as_ptr(), env1.as_ptr(), env2.as_ptr(), core::ptr::null()];
+			let mut entry: u64 = 0;
+			let mut stack_top: u64 = 0;
+			let rc = kernel_execve_file_args(
+				ysh_path.as_ptr(),
+				argv.as_ptr(), 1,
+				envp.as_ptr(), 3,
+				&mut entry, &mut stack_top,
+			);
+			if rc == 0 && entry != 0 {
+				console_fb_set_cursor(col as u64, row as u64);
+				exec_enter_usermode(entry, stack_top, vmm_user_cr3());
+				let packed = console_fb_get_cursor();
+				col = packed as u32 as usize;
+				row = (packed >> 32) as usize;
+			}
+		}
+
+		let prompt = b"YabroOS-32 rescue> ";
 		print_str(prompt, &mut col, &mut row);
 
 		let mut buffer = [0u8; 128];
@@ -1553,7 +2155,7 @@ pub extern "C" fn kernel_main() -> ! {
 					let cmd_slice = &buffer[..buf_idx];
 
 					if cmd_slice == b"help" {
-						let help_text = b"\n=== YabroOS-32 Shell Commands ===\nhelp   - Show this help\ncls    - Clear screen\necho   - Print text\nfetch  - System information\nreboot - Reboot system\ntime   - Show RTC time\ncalc   - Simple calculator (e.g. calc 2+3)\nls     - List files\ncat    - View a file\nrun    - Run an ELF program\ngraphics - Run /GFX-TEST.ELF\n\nUserspace: run YSH.ELF to start YSH.\n\n";
+						let help_text = b"\n=== YabroOS-32 Shell Commands ===\nhelp    - Show this help\ncls     - Clear screen\necho    - Print text\nfetch   - System information\nreboot  - Reboot system\nshutdown - Shut down system\ntime    - Show RTC time\ncalc    - Simple calculator (e.g. calc 2+3)\nls      - List files\ncat     - View a file\nrun     - Run an ELF program\n\nUserspace: run YSH.ELF to start YSH.\n\n";
 						print_str(help_text, &mut col, &mut row);
 					}
 
@@ -1564,14 +2166,25 @@ pub extern "C" fn kernel_main() -> ! {
 					}
 
 					else if cmd_slice == b"fetch" {
-						let fetch_text = b"\nYabroOS-32 Kernel v0.0.2-alpha (with ELF loader)\nRust + C Hybrid Kernel\nArchitecture: x86_64 / Limine\n\n";
+						let fetch_text = b"\nYabroOS-32 Kernel v0.1 (with ELF loader)\nRust + C Hybrid Kernel\nArchitecture: x86_64 / Limine\n\n";
 						print_str(fetch_text, &mut col, &mut row);
 					}
 
 					else if cmd_slice == b"reboot" {
 						let reboot_text = b"\nRebooting...\n";
 						print_str(reboot_text, &mut col, &mut row);
-						asm!("mov al, 0xfe; out 0x64, al");
+						bsod_reboot();
+					}
+
+					else if cmd_slice == b"shutdown" {
+						let msg = b"\nPowering off...\n";
+						print_str(msg, &mut col, &mut row);
+						unsafe {
+							extern "C" {
+								fn sys_system_shutdown() -> i64;
+							}
+							sys_system_shutdown();
+						}
 					}
 
 					else if cmd_slice.starts_with(b"echo ") {
@@ -1933,8 +2546,7 @@ pub extern "C" fn kernel_main() -> ! {
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
-	loop {
-		unsafe { asm!("cli; hlt"); }
-	}
+    unsafe { debugcon_str(b"\n[PANIC] Rust kernel panic; system halted\n"); }
+    loop { unsafe { asm!("cli; hlt"); } }
 }
 

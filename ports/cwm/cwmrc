@@ -1,0 +1,33 @@
+# YabroOS desktop session: cwm
+# Floating X11 window management with clear focus borders and compact margins.
+fontname "sans-serif:size=10"
+borderwidth 2
+color activeborder "#65b8ff"
+color inactiveborder "#3b4658"
+color urgencyborder "#f87171"
+color groupborder "#a78bfa"
+color ungroupborder "#5eead4"
+gap 6 6 6 6
+snapdist 12
+moveamount 16
+
+# Use native XTerm. Repeating a terminal binding opens another window with its own PTY.
+command term "/usr/bin/xterm"
+command xclock "/usr/bin/xclock"
+command xeyes "/usr/bin/xeyes"
+
+# Meta is normally the left Alt key in this Xorg/XKB layout.
+bind-key M-Return terminal
+bind-key CM-Return terminal
+bind-key M-t terminal
+bind-key M-Tab window-cycle
+bind-key MS-Tab window-rcycle
+bind-key M-space menu-cmd
+bind-key M-slash menu-exec
+bind-key M-q window-close
+bind-key CM-r restart
+bind-key M-1 group-only-1
+bind-key M-2 group-only-2
+bind-key M-3 group-only-3
+bind-mouse M-1 window-move
+bind-mouse M-3 window-resize
