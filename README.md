@@ -12,7 +12,7 @@
 ![status](https://img.shields.io/badge/status-v0.1%20experimental-orange)
 ![arch](https://img.shields.io/badge/arch-x86__64-blue)
 ![boot](https://img.shields.io/badge/boot-Limine%20BIOS%20%2F%20UEFI-lightgrey)
-![license](https://img.shields.io/badge/license-none%20yet-lightgrey)
+![license](https://img.shields.io/badge/license-GPLv3-blue)
 
 </div>
 
